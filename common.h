@@ -16,6 +16,7 @@ typedef uint32_t vaddr_t;               // virtual memory address
 #define is_aligned(value, align) __builtin_is_aligned(value, align)
 #define offsetof(type, member)   __builtin_offsetof(type, member)       // offset of a member of a struct
 #define PAGE_SIZE 4096
+#define MAX_PAGE 100000
 
 /* clang builtin features */
 #define va_list  __builtin_va_list

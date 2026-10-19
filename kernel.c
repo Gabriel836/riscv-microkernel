@@ -8,17 +8,82 @@ typedef uint32_t size_t;
 /* addresses obtained from kernel.ld symbols */
 /* extern char __bss: 0th byte of .bss section; extern char __bss[]: start address of the .bss section */
 extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[];
+static char bitmap[MAX_PAGE];
+static size_t memsize;
+
+void memory_init(void) {
+    size_t ram_bytes = (size_t)(__free_ram_end - __free_ram);
+
+    if (ram_bytes % PAGE_SIZE != 0)
+        PANIC("RAM size is not page-aligned");
+
+    memsize = ram_bytes / PAGE_SIZE;
+    printf("memesize %d\n", memsize);
+
+    if (memsize > MAX_PAGE)
+        PANIC("bitmap too small");
+}
+
+void print_bitmap(size_t n) {
+    for (size_t i = 0; i < n && i < memsize; i++) {
+        printf("%d", bitmap[i]);
+
+        if ((i + 1) % 8 == 0)
+            printf(" ");
+
+        if ((i + 1) % 32 == 0)
+            printf("\n");
+    }
+
+    printf("\n");
+}
+
+void free_pages(paddr_t paddr, size_t n) {
+    if (n == 0)
+        PANIC("free_pages: invalid size");
+
+    if (paddr < (paddr_t)__free_ram ||
+        paddr >= (paddr_t)__free_ram_end)
+        PANIC("free_pages: invalid address");
+
+    if ((paddr - (paddr_t)__free_ram) % PAGE_SIZE != 0)
+        PANIC("free_pages: unaligned address");
+
+    size_t i =
+        (paddr - (paddr_t)__free_ram) / PAGE_SIZE;
+
+    if (n > memsize - i)
+        PANIC("free_pages: out of range");
+
+    for (size_t j = 0; j < n; j++) {
+        if (bitmap[i + j] == 0)
+            PANIC("free_pages: double free");
+
+        bitmap[i + j] = 0;
+    }
+}
 
 paddr_t alloc_pages(uint32_t n) {
-    static paddr_t next_paddr = (paddr_t) __free_ram; // value mantained (static)
-    paddr_t paddr = next_paddr;
-    next_paddr += n * PAGE_SIZE;
-
-    if (next_paddr > (paddr_t) __free_ram_end)
-        PANIC("out of memory");
-
-    memset((void *) paddr, 0, n * PAGE_SIZE);
-    return paddr;
+    size_t i, j;
+    for(i=0; i<memsize; i++) {
+        if(bitmap[i] == 0) {
+            for(j=0; j<n; j++) {
+                if(i+j >= memsize) PANIC("out of memory");
+                if(bitmap[i+j] != 0) {
+                    i=i+j;
+                    break;
+                }
+            }
+            if(j==n) {
+                for(j=0; j<n; j++) {
+                    bitmap[i+j] = 1;
+                }
+            return (paddr_t)
+                (__free_ram + i * PAGE_SIZE);
+            }
+        }
+    }
+    PANIC("allocation error!");
 }
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
@@ -133,11 +198,19 @@ void handle_trap(struct trap_frame *f) {
 
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
-
+    memory_init();
     paddr_t paddr0 = alloc_pages(2);
     paddr_t paddr1 = alloc_pages(1);
     printf("alloc_pages test: paddr0=%x\n", paddr0);
     printf("alloc_pages test: paddr1=%x\n", paddr1);
+    printf("alloc_pages test: __free_ram_end=%x\n", (paddr_t)__free_ram_end);
+    print_bitmap(8);
+    free_pages(paddr0, 2);
+    print_bitmap(8);
+    paddr0 = alloc_pages(1);
+    print_bitmap(8);
+    paddr_t paddr2 = alloc_pages(2);
+    print_bitmap(8);
 
     PANIC("booted!");
 }
