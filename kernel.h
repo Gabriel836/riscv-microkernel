@@ -5,6 +5,7 @@
 
 #define PROC_UNUSED   0   // Unused process control structure
 #define PROC_RUNNABLE 1   // Runnable process
+#define PROC_BLOCKED 2
 
 struct process {
     int pid;             // Process ID

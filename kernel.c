@@ -225,17 +225,25 @@ void yield(void) {
     if (next == current_proc)
         return;
 
+    // store a pointer to the bottom of the kernel stack of the current running process
+    __asm__ __volatile__(
+        "csrw sscratch, %[sscratch]\n"
+        :
+        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+    );
+
     // Context switch
     struct process *prev = current_proc;
     current_proc = next;
     switch_context(&prev->sp, &next->sp);
 }
 
+/* EXCEPTION HANDLER */
 __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
-        "csrw sscratch, sp\n"           // saving sp to use it later (register values will be saved in the stack)
+        "csrrw sp, sscratch, sp\n"      // Retrieve the kernel stack of the running process from sscratch.
         "addi sp, sp, -4 * 31\n"        // Allocate space for the trap_frame struct
         "sw ra,  4 * 0(sp)\n"           // saving the state of the machine (register values) in the stack
         "sw gp,  4 * 1(sp)\n"
@@ -270,6 +278,10 @@ void kernel_entry(void) {
 
         "csrr a0, sscratch\n"           // sscratch = sp; a0 (after saved) = sscratch -> a0 = sp;
         "sw a0, 4 * 30(sp)\n"           // saves the value of sp in the stack
+
+        // Reset the kernel stack.
+        "addi a0, sp, 4 * 31\n"
+        "csrw sscratch, a0\n"
 
         "mv a0, sp\n"                   // a0 receives the value of sp (end of trap frame)
         "call handle_trap\n"            // a0 passes the argument
