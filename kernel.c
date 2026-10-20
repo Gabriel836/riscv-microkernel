@@ -8,9 +8,11 @@ typedef uint32_t size_t;
 /* addresses obtained from kernel.ld symbols */
 /* extern char __bss: 0th byte of .bss section; extern char __bss[]: start address of the .bss section */
 extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[];
-static char bitmap[MAX_PAGE];
+static char bitmap[MAX_PAGE]; // keeps track of the memory pages (allocated or not)
 static size_t memsize;
 
+/* MEMORY MANAGING */
+/* initializes the global variable memsize: memory size (in pages) of free ram */
 void memory_init(void) {
     size_t ram_bytes = (size_t)(__free_ram_end - __free_ram);
 
@@ -24,6 +26,7 @@ void memory_init(void) {
         PANIC("bitmap too small");
 }
 
+/* prints the bitmap keeping track of the memory pages */
 void print_bitmap(size_t n) {
     for (size_t i = 0; i < n && i < memsize; i++) {
         printf("%d", bitmap[i]);
@@ -38,23 +41,28 @@ void print_bitmap(size_t n) {
     printf("\n");
 }
 
+/* frees memory pages */
 void free_pages(paddr_t paddr, size_t n) {
     if (n == 0)
         PANIC("free_pages: invalid size");
 
+    // physical address before or after designated free ram
     if (paddr < (paddr_t)__free_ram ||
         paddr >= (paddr_t)__free_ram_end)
         PANIC("free_pages: invalid address");
 
+    // physical address unaligned
     if ((paddr - (paddr_t)__free_ram) % PAGE_SIZE != 0)
         PANIC("free_pages: unaligned address");
 
     size_t i =
         (paddr - (paddr_t)__free_ram) / PAGE_SIZE;
 
+    // checks if the memory size fits in the designated memory
     if (n > memsize - i)
         PANIC("free_pages: out of range");
 
+    // frees memory (clause for double free)
     for (size_t j = 0; j < n; j++) {
         if (bitmap[i + j] == 0)
             PANIC("free_pages: double free");
@@ -63,8 +71,10 @@ void free_pages(paddr_t paddr, size_t n) {
     }
 }
 
+/* allocate memory pages, keeping track */
 paddr_t alloc_pages(uint32_t n) {
     size_t i, j;
+    // search linarly for the first continguos available space
     for(i=0; i<memsize; i++) {
         if(bitmap[i] == 0) {
             for(j=0; j<n; j++) {
@@ -107,6 +117,118 @@ struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
 
 void putchar(char ch) {
     sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
+}
+
+
+/* PROCESS HANDLING FUNCTIONS */
+struct process procs[PROCS_MAX]; // All process control structures.
+
+struct process *create_process(uint32_t pc) {
+    // Find an unused process control structure.
+    struct process *proc = NULL;
+    int i;
+    for (i = 0; i < PROCS_MAX; i++) {
+        if (procs[i].state == PROC_UNUSED) {
+            proc = &procs[i];
+            break;
+        }
+    }
+
+    if (!proc)
+        PANIC("no free process slots");
+
+    // Stack callee-saved registers. These register values will be restored in
+    // the first context switch in switch_context.
+    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
+    *--sp = 0;                      // s11
+    *--sp = 0;                      // s10
+    *--sp = 0;                      // s9
+    *--sp = 0;                      // s8
+    *--sp = 0;                      // s7
+    *--sp = 0;                      // s6
+    *--sp = 0;                      // s5
+    *--sp = 0;                      // s4
+    *--sp = 0;                      // s3
+    *--sp = 0;                      // s2
+    *--sp = 0;                      // s1
+    *--sp = 0;                      // s0
+    *--sp = (uint32_t) pc;          // ra
+
+    // Initialize fields.
+    proc->pid = i + 1;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t) sp;
+    return proc;
+}
+
+/* context switching between process */
+/* execution context is saved in the stack as local variables */
+/* callee-saved registers (stacked) must be restored */
+__attribute__((naked)) void switch_context(uint32_t *prev_sp,
+                                           uint32_t *next_sp) {
+    __asm__ __volatile__(
+        // Save callee-saved registers onto the current process's stack.
+        "addi sp, sp, -13 * 4\n" // Allocate stack space for 13 4-byte registers
+        "sw ra,  0  * 4(sp)\n"   // Save callee-saved registers only
+        "sw s0,  1  * 4(sp)\n"
+        "sw s1,  2  * 4(sp)\n"
+        "sw s2,  3  * 4(sp)\n"
+        "sw s3,  4  * 4(sp)\n"
+        "sw s4,  5  * 4(sp)\n"
+        "sw s5,  6  * 4(sp)\n"
+        "sw s6,  7  * 4(sp)\n"
+        "sw s7,  8  * 4(sp)\n"
+        "sw s8,  9  * 4(sp)\n"
+        "sw s9,  10 * 4(sp)\n"
+        "sw s10, 11 * 4(sp)\n"
+        "sw s11, 12 * 4(sp)\n"
+
+        // Switch the stack pointer.
+        "sw sp, (a0)\n"         // *prev_sp = sp;
+        "lw sp, (a1)\n"         // Switch stack pointer (sp) here
+
+        // Restore callee-saved registers from the next process's stack.
+        "lw ra,  0  * 4(sp)\n"  // Restore callee-saved registers only
+        "lw s0,  1  * 4(sp)\n"
+        "lw s1,  2  * 4(sp)\n"
+        "lw s2,  3  * 4(sp)\n"
+        "lw s3,  4  * 4(sp)\n"
+        "lw s4,  5  * 4(sp)\n"
+        "lw s5,  6  * 4(sp)\n"
+        "lw s6,  7  * 4(sp)\n"
+        "lw s7,  8  * 4(sp)\n"
+        "lw s8,  9  * 4(sp)\n"
+        "lw s9,  10 * 4(sp)\n"
+        "lw s10, 11 * 4(sp)\n"
+        "lw s11, 12 * 4(sp)\n"
+        "addi sp, sp, 13 * 4\n"  // We've popped 13 4-byte registers from the stack
+        "ret\n"
+    );
+}
+
+/* SCHEDULER */
+struct process *current_proc; // Currently running process
+struct process *idle_proc;    // Idle process (waiting)
+
+void yield(void) {
+    // Search for a runnable process
+    struct process *next = idle_proc;
+    for (int i = 0; i < PROCS_MAX; i++) {
+        struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
+        if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
+            next = proc;
+            break;
+        }
+    }
+
+    // If there's no runnable process other than the current one, return and continue processing
+    if (next == current_proc)
+        return;
+
+    // Context switch
+    struct process *prev = current_proc;
+    current_proc = next;
+    switch_context(&prev->sp, &next->sp);
 }
 
 __attribute__((naked))
@@ -196,8 +318,35 @@ void handle_trap(struct trap_frame *f) {
     PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
 }
 
+/* for proccess testing */
+void delay(void) {
+    for (int i = 0; i < 30000000; i++)
+        __asm__ __volatile__("nop"); // do nothing
+}
+
+struct process *proc_a;
+struct process *proc_b;
+
+void proc_a_entry(void) {
+    printf("starting process A\n");
+    while (1) {
+        putchar('A');
+        yield();
+    }
+}
+
+void proc_b_entry(void) {
+    printf("starting process B\n");
+    while (1) {
+        putchar('B');
+        yield();
+    }
+}
+
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
+
+    // memory allocation testing
     memory_init();
     paddr_t paddr0 = alloc_pages(2);
     paddr_t paddr1 = alloc_pages(1);
@@ -211,6 +360,19 @@ void kernel_main(void) {
     print_bitmap(8);
     paddr_t paddr2 = alloc_pages(2);
     print_bitmap(8);
+
+    // proccess handling testing
+    WRITE_CSR(stvec, (uint32_t) kernel_entry);
+
+    idle_proc = create_process((uint32_t) NULL);
+    idle_proc->pid = 0; // idle
+    current_proc = idle_proc;
+
+    proc_a = create_process((uint32_t) proc_a_entry);
+    proc_b = create_process((uint32_t) proc_b_entry);
+
+    yield();
+    PANIC("switched to idle process");
 
     PANIC("booted!");
 }
