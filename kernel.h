@@ -11,6 +11,7 @@ struct process {
     int pid;             // Process ID
     int state;           // Process state: PROC_UNUSED or PROC_RUNNABLE
     vaddr_t sp;          // Stack pointer
+    struct process *next;
     uint8_t stack[8192]; // Kernel stack (allow context switching)
 };
 
@@ -47,8 +48,6 @@ b = tmp;
         while (1) {}                                                           \
     } while (0)
 
-#include "common.h"
-
 
 /* c representation for the trap_frame stored in the stack */
 struct trap_frame {
@@ -83,6 +82,8 @@ struct trap_frame {
     uint32_t s10;
     uint32_t s11;
     uint32_t sp;
+    uint32_t sepc;
+    uint32_t sstatus;
 } __attribute__((packed));      // instruct the compiler not to put padding between members
 
 // #reg makes it possible to create asm code dinamically
@@ -98,3 +99,5 @@ struct trap_frame {
         uint32_t __tmp = (value);                                              \
         __asm__ __volatile__("csrw " #reg ", %0" ::"r"(__tmp));                \
     } while (0)
+
+void switch_context(uint32_t *prev_sp, uint32_t *next_sp);

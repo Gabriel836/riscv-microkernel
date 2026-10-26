@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "common.h"
+#include "scheduler.h"
 
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
@@ -11,7 +12,10 @@ extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[];
 static char bitmap[MAX_PAGE]; // keeps track of the memory pages (allocated or not)
 static size_t memsize;
 
-/* MEMORY MANAGING */
+/* ========================================================================== */
+/* MEMORY MANAGING                                                            */
+/* ========================================================================== */
+
 /* initializes the global variable memsize: memory size (in pages) of free ram */
 void memory_init(void) {
     size_t ram_bytes = (size_t)(__free_ram_end - __free_ram);
@@ -20,7 +24,7 @@ void memory_init(void) {
         PANIC("RAM size is not page-aligned");
 
     memsize = ram_bytes / PAGE_SIZE;
-    printf("memesize %d\n", memsize);
+    printf("memsize %d\n", memsize);
 
     if (memsize > MAX_PAGE)
         PANIC("bitmap too small");
@@ -55,8 +59,7 @@ void free_pages(paddr_t paddr, size_t n) {
     if ((paddr - (paddr_t)__free_ram) % PAGE_SIZE != 0)
         PANIC("free_pages: unaligned address");
 
-    size_t i =
-        (paddr - (paddr_t)__free_ram) / PAGE_SIZE;
+    size_t i = (paddr - (paddr_t)__free_ram) / PAGE_SIZE;
 
     // checks if the memory size fits in the designated memory
     if (n > memsize - i)
@@ -74,27 +77,29 @@ void free_pages(paddr_t paddr, size_t n) {
 /* allocate memory pages, keeping track */
 paddr_t alloc_pages(uint32_t n) {
     size_t i, j;
-    // search linarly for the first continguos available space
-    for(i=0; i<memsize; i++) {
-        if(bitmap[i] == 0) {
-            for(j=0; j<n; j++) {
-                if(i+j >= memsize) PANIC("out of memory");
-                if(bitmap[i+j] != 0) {
-                    i=i+j;
+    // search linearly for the first contiguous available space
+    for (i = 0; i < memsize; i++) {
+        if (bitmap[i] == 0) {
+            for (j = 0; j < n; j++) {
+                if (i + j >= memsize) PANIC("out of memory");
+                if (bitmap[i + j] != 0) {
+                    i = i + j;
                     break;
                 }
             }
-            if(j==n) {
-                for(j=0; j<n; j++) {
-                    bitmap[i+j] = 1;
-                }
-            return (paddr_t)
-                (__free_ram + i * PAGE_SIZE);
+            if (j == n) {
+                for (j = 0; j < n; j++)
+                    bitmap[i + j] = 1;
+                return (paddr_t)(__free_ram + i * PAGE_SIZE);
             }
         }
     }
     PANIC("allocation error!");
 }
+
+/* ========================================================================== */
+/* SBI / CONSOLE                                                              */
+/* ========================================================================== */
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
@@ -119,9 +124,56 @@ void putchar(char ch) {
     sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
 }
 
+/* ========================================================================== */
+/* TIMER (preemption): the hardware timer is what measures the quantum        */
+/* ========================================================================== */
 
-/* PROCESS HANDLING FUNCTIONS */
+#define SBI_EXT_TIME    0x54494D45      // "TIME" extension id
+#define QUANTUM_TICKS   100000          // ~10 ms (QEMU virt: 10 MHz timer)
+#define SCAUSE_S_TIMER  0x80000005      // interrupt bit | cause 5 (supervisor timer)
+
+/* RV32: the time CSR is 64 bits wide, split in time/timeh */
+static unsigned long long read_time(void) {
+    uint32_t hi, lo, hi2;
+    do {
+        __asm__ __volatile__("rdtimeh %0" : "=r"(hi));
+        __asm__ __volatile__("rdtime  %0" : "=r"(lo));
+        __asm__ __volatile__("rdtimeh %0" : "=r"(hi2));
+    } while (hi != hi2);
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+/* schedules the next timer interrupt one quantum from now */
+static void timer_set_next(void) {
+    unsigned long long t = read_time() + QUANTUM_TICKS;
+    sbi_call((uint32_t)t, (uint32_t)(t >> 32), 0, 0, 0, 0,
+             0 /* fid: set_timer */, SBI_EXT_TIME);
+}
+
+static void timer_init(void) {
+    __asm__ __volatile__("csrs sie, %0" :: "r"(1 << 5));     // sie.STIE
+    timer_set_next();
+    __asm__ __volatile__("csrs sstatus, %0" :: "r"(1 << 1)); // sstatus.SIE (last)
+}
+
+/* ========================================================================== */
+/* PROCESS HANDLING                                                           */
+/* ========================================================================== */
+
 struct process procs[PROCS_MAX]; // All process control structures.
+
+/* every new process starts here: enables interrupts, then calls the real entry
+   point (kept in s0 by create_process). A new process is started by a `ret`
+   inside switch_context, usually called from the timer handler (SIE=0), and it
+   never goes through an `sret` that would re-enable interrupts. */
+__attribute__((naked)) void proc_trampoline(void) {
+    __asm__ __volatile__(
+        "csrsi sstatus, 2\n"    // sstatus.SIE = 1
+        "jalr s0\n"             // call the real entry
+        "1: wfi\n"              // entry returned: for now, just park (later: exit)
+        "j 1b\n"
+    );
+}
 
 struct process *create_process(uint32_t pc) {
     // Find an unused process control structure.
@@ -140,24 +192,26 @@ struct process *create_process(uint32_t pc) {
     // Stack callee-saved registers. These register values will be restored in
     // the first context switch in switch_context.
     uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
-    *--sp = 0;                      // s11
-    *--sp = 0;                      // s10
-    *--sp = 0;                      // s9
-    *--sp = 0;                      // s8
-    *--sp = 0;                      // s7
-    *--sp = 0;                      // s6
-    *--sp = 0;                      // s5
-    *--sp = 0;                      // s4
-    *--sp = 0;                      // s3
-    *--sp = 0;                      // s2
-    *--sp = 0;                      // s1
-    *--sp = 0;                      // s0
-    *--sp = (uint32_t) pc;          // ra
+    *--sp = 0;                          // s11
+    *--sp = 0;                          // s10
+    *--sp = 0;                          // s9
+    *--sp = 0;                          // s8
+    *--sp = 0;                          // s7
+    *--sp = 0;                          // s6
+    *--sp = 0;                          // s5
+    *--sp = 0;                          // s4
+    *--sp = 0;                          // s3
+    *--sp = 0;                          // s2
+    *--sp = 0;                          // s1
+    *--sp = (uint32_t) pc;              // s0  <- real entry point
+    *--sp = (uint32_t) proc_trampoline; // ra  <- first `ret` lands here
 
     // Initialize fields.
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
+
+    sched_enqueue(proc);                // goes to the tail of the ready queue
     return proc;
 }
 
@@ -206,46 +260,28 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
     );
 }
 
-/* SCHEDULER */
-struct process *current_proc; // Currently running process
-struct process *idle_proc;    // Idle process (waiting)
+/* the scheduler itself (ready queue, idle process, yield) lives in scheduler.c */
 
-void yield(void) {
-    // Search for a runnable process
-    struct process *next = idle_proc;
-    for (int i = 0; i < PROCS_MAX; i++) {
-        struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
-        if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
-            next = proc;
-            break;
-        }
-    }
+/* ========================================================================== */
+/* EXCEPTION HANDLER                                                          */
+/* ========================================================================== */
 
-    // If there's no runnable process other than the current one, return and continue processing
-    if (next == current_proc)
-        return;
-
-    // store a pointer to the bottom of the kernel stack of the current running process
-    __asm__ __volatile__(
-        "csrw sscratch, %[sscratch]\n"
-        :
-        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
-    );
-
-    // Context switch
-    struct process *prev = current_proc;
-    current_proc = next;
-    switch_context(&prev->sp, &next->sp);
-}
-
-/* EXCEPTION HANDLER */
+/* Works for traps coming from both U-mode and S-mode.
+   Convention: sscratch == 0        -> CPU is running kernel code
+               sscratch == k_stack  -> CPU is running user code (k_stack = top
+                                       of the current process's kernel stack)
+   sepc and sstatus are saved in the trap frame, so switching processes inside
+   handle_trap (preemption) is safe. */
 __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
-        "csrrw sp, sscratch, sp\n"      // Retrieve the kernel stack of the running process from sscratch.
-        "addi sp, sp, -4 * 31\n"        // Allocate space for the trap_frame struct
-        "sw ra,  4 * 0(sp)\n"           // saving the state of the machine (register values) in the stack
+        "csrrw sp, sscratch, sp\n"      // swap sp <-> sscratch
+        "bnez  sp, 1f\n"                // sp != 0: came from U-mode, sp = kernel stack
+        "csrr  sp, sscratch\n"          // sp == 0: came from S-mode, recover original sp
+        "1:\n"
+        "addi sp, sp, -4 * 36\n"        // trap frame (33 words used + padding, 16-byte aligned)
+        "sw ra,  4 * 0(sp)\n"
         "sw gp,  4 * 1(sp)\n"
         "sw tp,  4 * 2(sp)\n"
         "sw t0,  4 * 3(sp)\n"
@@ -276,15 +312,28 @@ void kernel_entry(void) {
         "sw s10, 4 * 28(sp)\n"
         "sw s11, 4 * 29(sp)\n"
 
-        "csrr a0, sscratch\n"           // sscratch = sp; a0 (after saved) = sscratch -> a0 = sp;
-        "sw a0, 4 * 30(sp)\n"           // saves the value of sp in the stack
+        "csrr a0, sscratch\n"           // sp of whoever trapped (user or kernel)
+        "sw   a0, 4 * 30(sp)\n"
+        "csrr a0, sepc\n"
+        "sw   a0, 4 * 31(sp)\n"
+        "csrr a0, sstatus\n"
+        "sw   a0, 4 * 32(sp)\n"
 
-        // Reset the kernel stack.
-        "addi a0, sp, 4 * 31\n"
+        "csrw sscratch, zero\n"         // now in the kernel: nested traps see 0
+
+        "mv   a0, sp\n"                 // a0 = pointer to the trap frame
+        "call handle_trap\n"
+
+        "lw   a0, 4 * 31(sp)\n"
+        "csrw sepc, a0\n"
+        "lw   a0, 4 * 32(sp)\n"
+        "csrw sstatus, a0\n"
+
+        "andi a0, a0, 1 << 8\n"         // sstatus.SPP
+        "bnez a0, 2f\n"                 // SPP=1: returning to kernel, sscratch stays 0
+        "addi a0, sp, 4 * 36\n"         // SPP=0: returning to user, sscratch = top of kernel stack
         "csrw sscratch, a0\n"
-
-        "mv a0, sp\n"                   // a0 receives the value of sp (end of trap frame)
-        "call handle_trap\n"            // a0 passes the argument
+        "2:\n"
 
         "lw ra,  4 * 0(sp)\n"
         "lw gp,  4 * 1(sp)\n"
@@ -321,29 +370,41 @@ void kernel_entry(void) {
     );
 }
 
-// after concluding the cause, and where the trap happened, it kills the kernel with PANIC
+/* timer interrupt -> end of quantum -> yield. Anything else is still fatal. */
 void handle_trap(struct trap_frame *f) {
     uint32_t scause = READ_CSR(scause);
-    uint32_t stval = READ_CSR(stval);
-    uint32_t user_pc = READ_CSR(sepc);
 
-    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+    if (scause == SCAUSE_S_TIMER) {
+        timer_set_next();   // re-arm first, otherwise the interrupt stays pending
+        yield();            // may switch to another process; we return here when rescheduled
+        return;
+    }
+
+    uint32_t stval = READ_CSR(stval);
+    PANIC("unexpected trap");
 }
 
-/* for proccess testing */
+/* ========================================================================== */
+/* PROCESS TESTING                                                            */
+/* ========================================================================== */
+
+/* busy-wait; tune DELAY_ITERS so that several chars are printed per quantum */
+#define DELAY_ITERS 300000
 void delay(void) {
-    for (int i = 0; i < 30000000; i++)
-        __asm__ __volatile__("nop"); // do nothing
+    for (int i = 0; i < DELAY_ITERS; i++)
+        __asm__ __volatile__("nop");
 }
 
 struct process *proc_a;
 struct process *proc_b;
 
+/* No voluntary yield(): the switches come only from the timer (preemption).
+   Expected output: blocks like AAAAAAAABBBBBBBB... */
 void proc_a_entry(void) {
     printf("starting process A\n");
     while (1) {
         putchar('A');
-        yield();
+        delay();
     }
 }
 
@@ -351,7 +412,8 @@ void proc_b_entry(void) {
     printf("starting process B\n");
     while (1) {
         putchar('B');
-        yield();
+        delay();
+        //yield();
     }
 }
 
@@ -372,21 +434,23 @@ void kernel_main(void) {
     print_bitmap(8);
     paddr_t paddr2 = alloc_pages(2);
     print_bitmap(8);
+    (void) paddr1; (void) paddr2;
 
-    // proccess handling testing
+    // process handling testing
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
+    WRITE_CSR(sscratch, 0);             // we are in the kernel: sscratch must be 0
 
-    idle_proc = create_process((uint32_t) NULL);
-    idle_proc->pid = 0; // idle
-    current_proc = idle_proc;
-
+    sched_init();                       // creates the idle context (this very flow)
     proc_a = create_process((uint32_t) proc_a_entry);
     proc_b = create_process((uint32_t) proc_b_entry);
 
-    yield();
-    PANIC("switched to idle process");
+    timer_init();                       // starts the quantum clock, last
 
-    PANIC("booted!");
+    // this is the idle process: runs only when the ready queue is empty
+    for (;;) {
+        yield();
+        __asm__ __volatile__("wfi");
+    }
 }
 
 __attribute__((section(".text.boot")))  // Positions the function boot in 0x80200000

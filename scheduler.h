@@ -1,20 +1,8 @@
 #pragma once
 #include "kernel.h"
 
-/* ROUND-ROBIN READY PROCESS LIST */
-typedef struct rr_node {
-    struct process *proc;
-    NODE_RR *next;
-} NODE_RR;
+extern struct process *current_proc;
 
-typedef struct rr_cursor {
-    NODE_RR *first;
-    NODE_RR *last;
-} LIST_RR;
-
-// managing functions
-LIST_RR* createList_RR();
-void addReadyProc_RR(LIST_RR *list, struct process *proc);
-void removeProc_RR(LIST_RR *list, struct process *proc);
-void switchProc_RR(LIST_RR *list);
-
+void sched_init(void);
+void sched_enqueue(struct process *p);   // coloca um processo RUNNABLE no fim da fila
+void yield(void);
