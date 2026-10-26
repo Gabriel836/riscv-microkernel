@@ -4,6 +4,7 @@ ENTRY(boot)
 SECTIONS {
     /* base address */
     . = 0x80200000;
+    __kernel_base = .;  
 
     /* program source code */
     .text :{
