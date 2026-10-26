@@ -24,7 +24,7 @@ void memory_init(void) {
         PANIC("RAM size is not page-aligned");
 
     memsize = ram_bytes / PAGE_SIZE;
-    printf("memsize %d\n", memsize);
+    printf("memsize %d\n", memsize);    // debug
 
     if (memsize > MAX_PAGE)
         PANIC("bitmap too small");
@@ -98,6 +98,30 @@ paddr_t alloc_pages(uint32_t n) {
 }
 
 /* ========================================================================== */
+/* PAGE TABLE                                                                 */
+/* ========================================================================== */
+
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!is_aligned(vaddr, PAGE_SIZE))
+        PANIC("unaligned vaddr %x", vaddr);
+
+    if (!is_aligned(paddr, PAGE_SIZE))
+        PANIC("unaligned paddr %x", paddr);
+
+    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;  // extract the 10 m-s bits for level 1
+    if ((table1[vpn1] & PAGE_V) == 0) {
+        // Create the 1st level page table if it doesn't exist.
+        uint32_t pt_paddr = alloc_pages(1);
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+    }
+
+    // Set the 2nd level page table entry to map the physical page.
+    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
+/* ========================================================================== */
 /* SBI / CONSOLE                                                              */
 /* ========================================================================== */
 
@@ -150,6 +174,7 @@ static void timer_set_next(void) {
              0 /* fid: set_timer */, SBI_EXT_TIME);
 }
 
+
 static void timer_init(void) {
     __asm__ __volatile__("csrs sie, %0" :: "r"(1 << 5));     // sie.STIE
     timer_set_next();
@@ -157,40 +182,17 @@ static void timer_init(void) {
 }
 
 /* ========================================================================== */
-/* PAGE TABLE                                                                 */
-/* ========================================================================== */
-
-void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
-    if (!is_aligned(vaddr, PAGE_SIZE))
-        PANIC("unaligned vaddr %x", vaddr);
-
-    if (!is_aligned(paddr, PAGE_SIZE))
-        PANIC("unaligned paddr %x", paddr);
-
-    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
-    if ((table1[vpn1] & PAGE_V) == 0) {
-        // Create the 1st level page table if it doesn't exist.
-        uint32_t pt_paddr = alloc_pages(1);
-        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
-    }
-
-    // Set the 2nd level page table entry to map the physical page.
-    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
-    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
-    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
-}
-
-/* ========================================================================== */
 /* APPLICATION HANDLING (U-MODE)                                              */
 /* ========================================================================== */
 
+// lowers privilleges 
 __attribute__((naked)) void user_entry(void) {
     __asm__ __volatile__(
         "csrw sepc, %[sepc]        \n"
         "csrw sstatus, %[sstatus]  \n"
         "sret                      \n"
         :
-        : [sepc] "r" (USER_BASE),
+        : [sepc] "r" (USER_BASE),           // points to the start of the application
           [sstatus] "r" (SSTATUS_SPIE)
     );
 }
@@ -198,8 +200,6 @@ __attribute__((naked)) void user_entry(void) {
 /* ========================================================================== */
 /* PROCESS HANDLING                                                           */
 /* ========================================================================== */
-
-
 
 struct process procs[PROCS_MAX]; // All process control structures.
 
@@ -217,7 +217,7 @@ __attribute__((naked)) void proc_trampoline(void) {
 }
 
 struct process *create_process(const void *image, size_t image_size) {
-    // 1. Encontra um slot livre no array de processos
+    // find an empty slot in the proc array
     struct process *proc = NULL;
     int i;
     for (i = 0; i < PROCS_MAX; i++) {           //[cite: 3, 4]
@@ -230,8 +230,8 @@ struct process *create_process(const void *image, size_t image_size) {
     if (!proc)
         PANIC("no free process slots");         //
 
-    // 2. Forja o contexto na pilha do Kernel (A grande mudança dos registradores)
-    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)]; //[cite: 3, 4]
+    // fakes a context in the kernel stack
+    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)]; 
     *--sp = 0;                      // s11
     *--sp = 0;                      // s10
     *--sp = 0;                      // s9
@@ -243,39 +243,37 @@ struct process *create_process(const void *image, size_t image_size) {
     *--sp = 0;                      // s3
     *--sp = 0;                      // s2
     *--sp = 0;                      // s1
-    *--sp = 0;                      // s0 (Zeradinho, não usamos mais para guardar o 'pc')
-    *--sp = (uint32_t) user_entry;  // ra (AGORA APONTA PARA user_entry!)
+    *--sp = 0;                      // s0
+    *--sp = (uint32_t) user_entry;  // ra
 
-    // 3. Cria a Page Table do processo
+    // creates the process page table
     uint32_t *page_table = (uint32_t *) alloc_pages(1); //
 
-    // 4. Mapeia as páginas do Kernel (Identity Mapping)
-    // O kernel precisa continuar acessível na memória virtual enquanto o processo roda, 
-    // para tratar interrupções (Traps) e System Calls.
-    for (paddr_t paddr = (paddr_t) 0x80200000;          // 0x80200000 é a base no kernel.ld[cite: 5]
-         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE) //[cite: 3, 5]
+    // maps the process pages (identity mapping)
+    for (paddr_t paddr = (paddr_t) 0x80200000;          // 0x80200000 is the base address
+        paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 
-    // 5. Mapeia e copia o binário do Aplicativo do Usuário (image)
+    // maps and copy the application binary (image)
     for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
-        paddr_t page = alloc_pages(1);                  //[cite: 3]
+        paddr_t page = alloc_pages(1);
         
         size_t remaining = image_size - off;
         size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
         
-        memcpy((void *) page, image + off, copy_size);  //[cite: 1, 2]
+        memcpy((void *) page, image + off, copy_size);
         
-        // Mapeia para uma região isolada virtual (USER_BASE) com flag PAGE_U (Usuário pode acessar)
+        // maps to a virtual region
         map_page(page_table, USER_BASE + off, page, PAGE_U | PAGE_R | PAGE_W | PAGE_X);
     }
 
-    // 6. Atualiza o bloco de controle e põe na fila do escalonador
-    proc->pid = i + 1;                  //[cite: 3]
-    proc->state = PROC_RUNNABLE;        //[cite: 3, 4]
-    proc->sp = (uint32_t) sp;           //[cite: 3, 4]
-    proc->page_table = page_table;      // (Campo que você adicionou no kernel.h para salvar o SATP)
+    // updates control and add it to the scheduler
+    proc->pid = i + 1;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t) sp;
+    proc->page_table = page_table;
 
-    sched_enqueue(proc);                //[cite: 3, 7]
+    sched_enqueue(proc);
     return proc;
 }
 
@@ -340,7 +338,7 @@ __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
-        "csrrw sp, sscratch, sp\n"      // swap sp <-> sscratch
+        "csrrw sp, sscratch, sp\n"      // swap sp sscratch
         "bnez  sp, 1f\n"                // sp != 0: came from U-mode, sp = kernel stack
         "csrr  sp, sscratch\n"          // sp == 0: came from S-mode, recover original sp
         "1:\n"
@@ -464,8 +462,6 @@ void delay(void) {
 struct process *proc_a;
 struct process *proc_b;
 
-/* No voluntary yield(): the switches come only from the timer (preemption).
-   Expected output: blocks like AAAAAAAABBBBBBBB... */
 void proc_a_entry(void) {
     printf("starting process A\n");
     while (1) {
@@ -484,39 +480,34 @@ void proc_b_entry(void) {
 }
 
 void kernel_main(void) {
-    // 1. Zera a seção BSS (mantido do seu código)
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
     printf("\n\n");
 
-    // 2. Inicializa a Memória (Essencial: Nuta omite no snippet, mas você DEVE manter)
+    // initializes memory
     memory_init();
 
-    // 3. Configuração de Traps (mantido)
+    // traps config
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
     WRITE_CSR(sscratch, 0);
 
-    // 4. Inicializa a Fila e o Processo Ocioso (mantido)
+    // initializes queue and idle_proc
     sched_init(); 
     
-    // NOVO: O processo ocioso (agora em current_proc) precisa de uma Tabela de Páginas!
-    // Se não fizermos isso, o yield() vai dar crash ao tentar ler current_proc->page_table.
+    // idle proc needs a page table
     uint32_t *idle_page_table = (uint32_t *) alloc_pages(1);
     for (paddr_t paddr = (paddr_t) 0x80200000; paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE) {
         map_page(idle_page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
     }
     current_proc->page_table = idle_page_table;
 
-    // NOVO: Cria o processo de usuário injetando o binário compilado
+    // creates an user procces injection the binary
     create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
 
-    // 5. Inicia o relógio quântico (mantido)
+    // itializes timer
     timer_init();
 
-    // 6. Laço do processo ocioso (Idle Loop)
-    // O Nuta usa um PANIC aqui porque o yield dele pula para a shell e nunca mais volta.
-    // Mas no seu sistema com preempção e fila, quando a shell esperar entrada (I/O) 
-    // ou não houver nada na fila, o yield chamará a idle_proc e a CPU precisará dormir.
+    // idle loop
     for (;;) {
         yield();
         __asm__ __volatile__("wfi");

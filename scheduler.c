@@ -4,7 +4,7 @@ struct process *current_proc;
 static struct process idle_proc;
 static struct process *rq_head, *rq_tail;
 
-/* desliga interrupções e devolve o estado anterior (bit SIE) */
+/* turn off interrupts and return previous state (bit SIE) */
 static inline uint32_t irq_save(void) {
     uint32_t old;
     __asm__ __volatile__("csrrci %0, sstatus, 2" : "=r"(old));
@@ -17,8 +17,8 @@ static inline void irq_restore(uint32_t flags) {
 
 void sched_init(void) {
     idle_proc.pid = 0;
-    idle_proc.state = PROC_RUNNABLE;   // seu sp é preenchido no primeiro switch_context
-    current_proc = &idle_proc;         // "quem está rodando agora" = o kernel_main
+    idle_proc.state = PROC_RUNNABLE;
+    current_proc = &idle_proc;         // kernel main running now
 }
 
 void sched_enqueue(struct process *p) {
@@ -40,16 +40,16 @@ static struct process *sched_dequeue(void) {
 }
 
 void yield(void) {
-    uint32_t f = irq_save();                 // a fila não pode mudar no meio disso
+    uint32_t f = irq_save();                 // queue cant change now
 
     struct process *prev = current_proc;
 
-    // o atual volta para o fim da fila, se ainda puder rodar (idle nunca entra)
+    // current process go to the end of the line
     if (prev != &idle_proc && prev->state == PROC_RUNNABLE)
-        sched_enqueue(prev);                 // irq_save aninhado é ok
+        sched_enqueue(prev);
 
     struct process *next = sched_dequeue();
-    if (!next) next = &idle_proc;            // fila vazia: roda o idle
+    if (!next) next = &idle_proc;            // empty queue: idle
 
     if (next != prev) {
         current_proc = next;
@@ -63,7 +63,6 @@ void yield(void) {
               [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
         );
         switch_context(&prev->sp, &next->sp);
-        // só chegamos aqui quando `prev` for escalonado de novo
     }
     irq_restore(f);
 }
